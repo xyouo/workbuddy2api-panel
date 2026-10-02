@@ -230,7 +230,7 @@ mkdir -p auths data && cp config.example.json config.json
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api \
-  -p 7863:7863 -e TZ=Asia/Shanghai \
+  -p 7863:7863 -e TZ=Asia/Shanghai -e WB2A_LISTEN=:7863 \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
   ghcr.io/linguo2625469/workbuddy2api-panel:latest
 
@@ -353,7 +353,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `listen` | `:7863` | HTTP 监听地址 |
+| `listen` | `127.0.0.1:7863` | HTTP 监听地址；容器端口映射需要显式改为 `:7863` |
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
@@ -732,7 +732,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 2. 网络暴露与日志敏感度
 
-- 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
+- 默认监听 `127.0.0.1:7863`；容器端口映射需显式配置 `:7863`。服务**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
 - 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
 
