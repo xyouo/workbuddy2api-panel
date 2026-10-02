@@ -1,0 +1,32 @@
+{
+  "listen": "127.0.0.1:7863",
+  "api_key": "REPLACE_WITH_A_LONG_RANDOM_SECRET",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "logging": {
+    "request_archive_enabled": true,
+    "request_retention_days": 7,
+    "request_archive_max_mb": 25,
+    "request_client_info": false
+  },
+  "schedule": {
+    "checkin_enabled": false,
+    "growth_enabled": false,
+    "travel_enabled": false,
+    "activity_enabled": false,
+    "keepalive_enabled": false,
+    "blackcat_enabled": false,
+    "balance_refresh_enabled": false
+  },
+  "features": {
+    "sanitize_blacklist_fingerprints": true
+  },
+  "prompt": {
+    "mode": "passthrough",
+    "file": ""
+  },
+  "upstash": {
+    "url": "",
+    "token": ""
+  }
+}

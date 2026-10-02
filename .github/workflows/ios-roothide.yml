@@ -1,0 +1,120 @@
+name: ios-roothide
+
+on:
+  pull_request:
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "config.ios.example.json"
+      - "scripts/verify-ios-artifact.sh"
+      - ".github/workflows/ios-roothide.yml"
+  workflow_dispatch:
+  push:
+    branches:
+      - work
+      - ios-roothide
+      - "ios-roothide/**"
+    tags: ["ios-v*"]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.22.5"
+  IOS_DEPLOYMENT_TARGET: "15.0"
+  UPSTREAM_COMMIT: "1b6abaa0cce4a960749494cad56d67fe87a6ee1f"
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Record pinned toolchain evidence
+        run: |
+          git merge-base --is-ancestor "$UPSTREAM_COMMIT" HEAD || {
+            echo "::error::adaptation branch does not descend from pinned upstream $UPSTREAM_COMMIT"
+            exit 1
+          }
+          sw_vers
+          go version
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos --find clang
+          xcrun --sdk iphoneos --find ld
+      - name: Test
+        run: go test ./...
+      - name: Build genuine iOS arm64 Mach-O
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG=$(xcrun --sdk iphoneos --find clang)
+          mkdir -p build dist
+          cat >build/ios-clang <<EOF
+          #!/bin/sh
+          exec "$CLANG" -target arm64-apple-ios${IOS_DEPLOYMENT_TARGET} -isysroot "$SDKROOT" "\$@"
+          EOF
+          chmod +x build/ios-clang scripts/verify-ios-artifact.sh
+          CGO_ENABLED=1 GOOS=ios GOARCH=arm64 \
+            CC="$PWD/build/ios-clang" \
+            go build -trimpath -buildmode=pie -ldflags='-s -w' -o dist/wb2api ./cmd/server
+          xcrun codesign --force --sign - --timestamp=none dist/wb2api
+          MIN_IOS_VERSION="$IOS_DEPLOYMENT_TARGET" scripts/verify-ios-artifact.sh dist/wb2api
+      - name: Assemble privacy-limited archive and checksums
+        run: |
+          cp config.ios.example.json LICENSE IOS-ROOTHIDE.md dist/
+          tar -C dist -czf workbuddy2api-panel-ios-arm64.tar.gz \
+            wb2api config.ios.example.json IOS-ROOTHIDE.md LICENSE
+          shasum -a 256 workbuddy2api-panel-ios-arm64.tar.gz > SHA256SUMS
+          tar -tzf workbuddy2api-panel-ios-arm64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy2api-panel-ios-arm64
+          path: |
+            workbuddy2api-panel-ios-arm64.tar.gz
+            SHA256SUMS
+            verify-*.txt
+          retention-days: 14
+
+  # A RootHide .deb is intentionally not emitted: its runtime path rewriting,
+  # libroot/libvroot linkage and device installation have not yet been verified.
+
+  publish-prerelease:
+    needs: build-ios
+    if: startsWith(github.ref, 'refs/tags/ios-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: workbuddy2api-panel-ios-arm64
+          path: dist
+      - name: Verify release payload
+        run: |
+          set -eu
+          cd dist
+          sha256sum -c SHA256SUMS
+          tar -tzf workbuddy2api-panel-ios-arm64.tar.gz
+          find . -maxdepth 1 -type f -printf '%f\n' | sort
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }} (iOS/RootHide preview)
+          prerelease: true
+          generate_release_notes: true
+          body: |
+            Third-party iOS/RootHide preview built from pinned upstream commit
+            `${{ env.UPSTREAM_COMMIT }}`. The Mach-O passed automated static
+            validation, but iOS 15.5 RootHide device validation is still pending.
+            No `.deb` is included until RootHide packaging is verified on-device.
+          files: |
+            dist/workbuddy2api-panel-ios-arm64.tar.gz
+            dist/SHA256SUMS

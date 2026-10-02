@@ -1,6 +1,6 @@
 {
-  "listen": ":7863",
-  "api_key": "test_key",
+  "listen": "127.0.0.1:7863",
+  "api_key": "REPLACE_WITH_A_LONG_RANDOM_SECRET",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "panel": {

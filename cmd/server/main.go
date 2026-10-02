@@ -48,8 +48,17 @@ func stateSibling(stateFile, name string) string {
 }
 
 func main() {
+	workDir := flag.String("work-dir", "", "工作目录（配置、账号、状态和日志的相对路径均从此目录解析）")
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
+	if *workDir != "" {
+		if err := os.MkdirAll(*workDir, 0o700); err != nil {
+			log.Fatalf("create work dir: %v", err)
+		}
+		if err := os.Chdir(*workDir); err != nil {
+			log.Fatalf("enter work dir: %v", err)
+		}
+	}
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
