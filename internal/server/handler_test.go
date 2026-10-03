@@ -842,6 +842,18 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 }
 
 func TestModelsEndpoint(t *testing.T) {
+	// The endpoint is intentionally dynamic-only. Seed its cache so this test
+	// verifies serialization rather than depending on a live catalog/network.
+	dynamicModelsCache.Lock()
+	oldIDs, oldFetched := dynamicModelsCache.ids, dynamicModelsCache.fetched
+	dynamicModelsCache.ids = []upstream.ModelInfo{{ID: "glm-5.2"}, {ID: "glm-5.3"}, {ID: "kimi-k2.7"}, {ID: "minimax-m3"}, {ID: "deepseek-v4-pro"}}
+	dynamicModelsCache.fetched = time.Now()
+	dynamicModelsCache.Unlock()
+	t.Cleanup(func() {
+		dynamicModelsCache.Lock()
+		dynamicModelsCache.ids, dynamicModelsCache.fetched = oldIDs, oldFetched
+		dynamicModelsCache.Unlock()
+	})
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
