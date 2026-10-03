@@ -64,19 +64,19 @@ model_reasoning_summary = "none"
 
 [model_providers.workbuddy]
 name = "WorkBuddy2API third-party adapter"
-base_url = "http://<PHONE-IP>:8080/v1"
+base_url = "http://127.0.0.1:7863/v1"
 env_key = "WORKBUDDY_API_KEY"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
 ```
 
-启动前设置 `WORKBUDDY_API_KEY='<占位密钥>'`。实现支持文本、HTTP/data URL 图片、function tools、Codex 自由文本 custom tools（转换为带 `input` 字段的函数并可逆还原）、工具结果和 SSE。客户端必须在每次请求提交完整历史；`previous_response_id`、`background`、Responses WebSocket、`/responses/compact`、hosted tools、加密 reasoning/签名和 grammar custom tool 会明确返回错误，不会被静默忽略。流式适配会等待上游 Chat SSE 完成后再发 Responses 事件，因此不是低延迟逐 token 转发。
+启动前设置 `WORKBUDDY_API_KEY='<占位密钥>'`。实现支持文本、HTTP/data URL 图片、function tools、Codex 自由文本 custom tools（包括 Codex 0.160.0 使用的 grammar 格式；转换为带 `input` 字段的函数并可逆还原）、工具结果和 SSE。客户端必须在每次请求提交完整历史；`previous_response_id`、`background`、Responses WebSocket、`/responses/compact`、hosted tools和加密 reasoning/签名会明确返回错误，不会被静默忽略。流式文本增量在上游每次写入后同步转换并 Flush，不等待完整回复；取消沿原请求 context 传播，异常断流不会生成成功完成事件。
 
 ## Claude Code（第三方 Messages 适配）
 
 ```sh
-export ANTHROPIC_BASE_URL='http://<PHONE-IP>:8080'
+export ANTHROPIC_BASE_URL='http://127.0.0.1:7863'
 export ANTHROPIC_AUTH_TOKEN='<占位密钥>'
 export ANTHROPIC_MODEL='cn:<GET-/v1/models-返回的模型>'
 claude
@@ -102,4 +102,4 @@ go vet ./...
 GOOS=ios GOARCH=arm64 CGO_ENABLED=1 go build ./cmd/server # 需 macOS + iPhoneOS SDK/clang；CI 使用完整命令
 ```
 
-测试使用合成账号和 mock HTTP 上游，验证转换、SSE 聚合、工具关联及既有 Chat Completions 回归；它不是实际 Codex/Claude 登录、生产账号或 iOS 真机验证。
+测试使用合成账号和 mock HTTP 上游，验证转换、实时 SSE、工具关联及既有 Chat Completions 回归；它不是实际 Codex/Claude 登录、生产账号或 iOS 真机验证。本修复环境未安装并登录 Codex CLI 0.160.0 或 Claude Code，因此客户端进程工具闭环仍待验证，不能把 HTTP 集成测试解释为真实客户端通过。
