@@ -334,10 +334,9 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 	}
 }
 
-// stripToolCallNames 收敛流式 tool_calls 的 name 语义为「每个 index 只出现一次」：
-// 首片保留 function.name，同一 index 后续分片里的 name 键一律删除（无论上游是
-// 空串还是重复非空串）。这是 OpenAI 官方流的真实形态——首帧带 name，后续帧只带
-// arguments 片段、不再出现 name 键——因此是累加型与覆盖型客户端的共同祖先行为。
+// stripToolCallNames normalizes repeated/cumulative names without discarding
+// genuine name fragments. Identity is index-first and falls back to call ID,
+// so distinct calls that omit index cannot suppress one another's names.
 //
 // 两类消费模型在该形态下同时正确：
 //   - 累加型（官方 WorkBuddy/CodeBuddy `name += tc_function?.name || ""`）：
@@ -347,9 +346,8 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 //     键缺失是比空串更安全的形态：`??` 与 truthy 守卫对缺失键必然保留旧值，
 //     而对空串，`??` 会误判为重设并清空工具名。
 //
-// seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
-// 只动 function.name 键，id/type/arguments 原样透传。
-func stripToolCallNames(obj map[string]any, seen map[int]bool) {
+// Only function.name is changed; id/type/arguments pass through unchanged.
+func stripToolCallNames(obj map[string]any, seen map[string]string) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
@@ -366,20 +364,42 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			if tc == nil {
 				continue
 			}
-			idx := 0
+			key := ""
 			if v, ok := tc["index"].(float64); ok {
-				idx = int(v)
+				key = fmt.Sprintf("index:%d", int(v))
+			} else if id, _ := tc["id"].(string); id != "" {
+				key = "id:" + id
 			}
-			if seen[idx] {
-				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
-				if fn, _ := tc["function"].(map[string]any); fn != nil {
-					delete(fn, "name")
-				}
+			if key == "" {
+				key = "implicit:0"
+			}
+			fn, _ := tc["function"].(map[string]any)
+			if fn == nil {
 				continue
 			}
-			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
-			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
-			seen[idx] = true
+			name, _ := fn["name"].(string)
+			old, exists := seen[key]
+			if !exists {
+				seen[key] = name
+				continue
+			}
+			if name == "" || name == old {
+				delete(fn, "name")
+				continue
+			}
+			// Some providers send a cumulative name ("rea" then "read"), while
+			// others send true deltas ("rea" then "d"). Normalize both to deltas.
+			if strings.HasPrefix(name, old) {
+				name = name[len(old):]
+				seen[key] = old + name
+			} else {
+				seen[key] = old + name
+			}
+			if name == "" {
+				delete(fn, "name")
+			} else {
+				fn["name"] = name
+			}
 		}
 	}
 }
@@ -489,9 +509,9 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string) 
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
-	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
-	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
-	toolCallSeen := map[int]bool{}
+	// toolCallSeen records the accumulated name per index/call ID so repeated,
+	// cumulative and fragmented provider forms normalize to true deltas.
+	toolCallSeen := map[string]string{}
 
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧

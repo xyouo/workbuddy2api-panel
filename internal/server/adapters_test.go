@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -318,8 +319,8 @@ func TestAdapterHTTPMultiTurnToolRoundTrip(t *testing.T) {
 		name, path, first, second string
 		headers                   map[string]string
 	}{
-		{"responses", "/v1/responses", `{"model":"glm-5.2","input":"read","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}`, `{"model":"glm-5.2","input":[{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"README.md\"}"},{"type":"function_call_output","call_id":"call_1","output":"contents"}]}`, nil},
-		{"anthropic", "/v1/messages", `{"model":"glm-5.2","max_tokens":10,"messages":[{"role":"user","content":"read"}],"tools":[{"name":"read","input_schema":{"type":"object"}}]}`, `{"model":"glm-5.2","max_tokens":10,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]}]}`, map[string]string{"anthropic-version": "2023-06-01"}},
+		{"responses", "/v1/responses", `{"model":"glm-5.2","stream":true,"input":"read","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}`, `{"model":"glm-5.2","stream":true,"input":[{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"README.md\"}"},{"type":"function_call_output","call_id":"call_1","output":"contents"}]}`, nil},
+		{"anthropic", "/v1/messages", `{"model":"glm-5.2","stream":true,"max_tokens":10,"messages":[{"role":"user","content":"read"}],"tools":[{"name":"read","input_schema":{"type":"object"}}]}`, `{"model":"glm-5.2","stream":true,"max_tokens":10,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"read","input":{"path":"README.md"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"contents"}]}]}`, map[string]string{"anthropic-version": "2023-06-01"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var mu sync.Mutex
@@ -364,5 +365,185 @@ func TestAdapterHTTPMultiTurnToolRoundTrip(t *testing.T) {
 				t.Fatalf("upstream requests=%q", requests)
 			}
 		})
+	}
+}
+
+func runAdapterStream(t *testing.T, path, requestBody, upstreamBody string, headers map[string]string) string {
+	t.Helper()
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, upstreamBody, true })
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	req, _ := http.NewRequest("POST", srv.URL+path, strings.NewReader(requestBody))
+	req.Header.Set("Content-Type", "application/json")
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d body=%s", resp.StatusCode, body)
+	}
+	return string(body)
+}
+
+func streamDataObjects(t *testing.T, body string) []map[string]any {
+	t.Helper()
+	var result []map[string]any
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var value map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &value); err != nil {
+			t.Fatalf("bad downstream event %q: %v", line, err)
+		}
+		result = append(result, value)
+	}
+	return result
+}
+
+func TestAdapterHTTPStableIndexesFragmentedNamesAndMissingIndexes(t *testing.T) {
+	upstreamBody := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"rea"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_a","function":{"name":"d","arguments":"{\"path\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"content":"between"}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_b","function":{"name":"write","arguments":"{\"text\":"}},{"id":"call_a","function":{"arguments":"\"README.md\"}"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_b","function":{"arguments":"\"ok\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":3,"total_tokens":11}}`,
+		`data: [DONE]`, "",
+	}, "\n\n")
+	tests := []struct {
+		name, path, request string
+		headers             map[string]string
+	}{
+		{"responses", "/v1/responses", `{"model":"glm-5.2","stream":true,"input":"work","tools":[{"type":"function","name":"read","parameters":{"type":"object"}},{"type":"function","name":"write","parameters":{"type":"object"}}]}`, nil},
+		{"anthropic", "/v1/messages", `{"model":"glm-5.2","stream":true,"max_tokens":20,"messages":[{"role":"user","content":"work"}],"tools":[{"name":"read","input_schema":{"type":"object"}},{"name":"write","input_schema":{"type":"object"}}]}`, map[string]string{"anthropic-version": "2023-06-01"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body := runAdapterStream(t, tc.path, tc.request, upstreamBody, tc.headers)
+			events := streamDataObjects(t, body)
+			indexes := map[string]map[int]bool{"call_a": {}, "call_b": {}}
+			textIndexes := map[int]bool{}
+			for _, event := range events {
+				id, _ := event["item_id"].(string)
+				id = strings.TrimPrefix(id, "fc_")
+				if item, _ := event["item"].(map[string]any); item != nil {
+					if value, _ := item["call_id"].(string); value != "" {
+						id = value
+					}
+				}
+				if block, _ := event["content_block"].(map[string]any); block != nil {
+					if value, _ := block["id"].(string); value != "" {
+						id = value
+					}
+				}
+				if _, ok := indexes[id]; ok {
+					if n, ok := event["output_index"].(float64); ok {
+						indexes[id][int(n)] = true
+					}
+					if n, ok := event["index"].(float64); ok {
+						indexes[id][int(n)] = true
+					}
+				}
+				if event["type"] == "response.output_text.delta" || event["type"] == "content_block_delta" && strings.Contains(fmt.Sprint(event["delta"]), "text_delta") {
+					if n, ok := event["output_index"].(float64); ok {
+						textIndexes[int(n)] = true
+					}
+					if n, ok := event["index"].(float64); ok {
+						textIndexes[int(n)] = true
+					}
+				}
+			}
+			for id, seen := range indexes {
+				if len(seen) != 1 {
+					t.Fatalf("%s changed indexes: %v\n%s", id, seen, body)
+				}
+			}
+			if len(textIndexes) != 1 {
+				t.Fatalf("text changed indexes: %v", textIndexes)
+			}
+			var assigned []int
+			for _, seen := range indexes {
+				for index := range seen {
+					assigned = append(assigned, index)
+				}
+			}
+			for index := range textIndexes {
+				assigned = append(assigned, index)
+			}
+			sort.Ints(assigned)
+			if len(assigned) != 3 || assigned[0] == assigned[1] || assigned[1] == assigned[2] {
+				t.Fatalf("item indexes are not unique: %v", assigned)
+			}
+			if tc.name == "anthropic" {
+				blockIDs := map[int]string{}
+				partial := map[int]string{}
+				for _, event := range events {
+					indexValue, hasIndex := event["index"].(float64)
+					if !hasIndex {
+						continue
+					}
+					index := int(indexValue)
+					if block, _ := event["content_block"].(map[string]any); block != nil {
+						if id, _ := block["id"].(string); id != "" {
+							blockIDs[index] = id
+						}
+					}
+					if delta, _ := event["delta"].(map[string]any); delta != nil {
+						if fragment, _ := delta["partial_json"].(string); fragment != "" {
+							partial[index] += fragment
+						}
+					}
+				}
+				wantInputs := map[string]string{"call_a": `{"path":"README.md"}`, "call_b": `{"text":"ok"}`}
+				for index, id := range blockIDs {
+					if partial[index] != wantInputs[id] {
+						t.Fatalf("tool %s input fragments=%q want %q", id, partial[index], wantInputs[id])
+					}
+					var input map[string]any
+					if err := json.Unmarshal([]byte(partial[index]), &input); err != nil {
+						t.Fatalf("tool %s invalid input: %v", id, err)
+					}
+				}
+			}
+			if strings.Contains(body, `"name":"rea"`) {
+				t.Fatalf("partial tool name was published: %s", body)
+			}
+			for _, want := range []string{`"name":"read"`, `"call_id":"call_a"`, `"name":"write"`, `"call_id":"call_b"`} {
+				if tc.name == "anthropic" {
+					want = strings.Replace(want, "call_id", "id", 1)
+				}
+				if !strings.Contains(body, want) {
+					t.Fatalf("missing %s in %s", want, body)
+				}
+			}
+			if tc.name == "anthropic" && !strings.Contains(body, `"stop_reason":"tool_use"`) {
+				t.Fatalf("tool finish did not map to tool_use: %s", body)
+			}
+		})
+	}
+}
+
+func TestResponsesHTTPFragmentedCustomToolName(t *testing.T) {
+	upstreamBody := strings.Join([]string{
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_patch","function":{"name":"apply_"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_patch","function":{"name":"patch","arguments":"{\"input\":\"*** Begin "}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"id":"call_patch","function":{"arguments":"Patch***\"}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`, "",
+	}, "\n\n")
+	request := `{"model":"glm-5.2","stream":true,"input":"patch","tools":[{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}]}`
+	body := runAdapterStream(t, "/v1/responses", request, upstreamBody, nil)
+	if strings.Contains(body, `"name":"apply_"`) || strings.Contains(body, `"type":"function_call"`) {
+		t.Fatalf("partial custom name was misclassified: %s", body)
+	}
+	for _, want := range []string{`"type":"custom_tool_call"`, `"name":"apply_patch"`, `"call_id":"call_patch"`, `"input":"*** Begin Patch***"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %s in %s", want, body)
+		}
 	}
 }

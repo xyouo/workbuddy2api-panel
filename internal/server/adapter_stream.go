@@ -73,12 +73,13 @@ func sseEmit(w http.ResponseWriter, typ string, value any) {
 }
 
 type streamTool struct {
-	index     int
-	order     int
-	id        string
-	name      strings.Builder
-	arguments strings.Builder
-	started   bool
+	index      int
+	order      int
+	id         string
+	name       strings.Builder
+	arguments  strings.Builder
+	started    bool
+	eventIndex int
 }
 
 type chatStreamParser struct {
@@ -112,12 +113,24 @@ func (s *chatStreamParser) toolIndex(raw map[string]any) int {
 				return index
 			}
 		}
+		// A previously unseen explicit ID always denotes a new call. Never merge it
+		// into the sole existing tool merely because index was omitted.
+		index := s.nextFallback
+		for s.tools[index] != nil {
+			index++
+		}
+		s.nextFallback = index + 1
+		return index
 	}
 	// A continuation without index/id is unambiguous only when one tool exists.
 	if len(s.tools) == 1 {
 		for index := range s.tools {
 			return index
 		}
+	}
+	if len(s.tools) > 1 {
+		s.fail("tool delta without index or id is ambiguous")
+		return -1
 	}
 	index := s.nextFallback
 	for s.tools[index] != nil {
@@ -176,9 +189,12 @@ func (s *chatStreamParser) consume(payload string) {
 				continue
 			}
 			index := s.toolIndex(raw)
+			if index < 0 {
+				continue
+			}
 			tool := s.tools[index]
 			if tool == nil {
-				tool = &streamTool{index: index, order: len(s.order)}
+				tool = &streamTool{index: index, order: len(s.order), eventIndex: -1}
 				s.tools[index] = tool
 				s.order = append(s.order, tool)
 			}
@@ -191,6 +207,10 @@ func (s *chatStreamParser) consume(payload string) {
 			}
 			fn, _ := raw["function"].(map[string]any)
 			if name, ok := fn["name"].(string); ok {
+				if tool.started && name != "" {
+					s.fail("tool name continued after its output item was published")
+					continue
+				}
 				tool.name.WriteString(name)
 			}
 			argDelta, _ := fn["arguments"].(string)
@@ -228,6 +248,19 @@ func (s *chatStreamParser) validateTools(custom map[string]bool) error {
 	return nil
 }
 
+func declaredToolNames(chat map[string]any) map[string]bool {
+	result := map[string]bool{}
+	tools, _ := chat["tools"].([]any)
+	for _, raw := range tools {
+		tool, _ := raw.(map[string]any)
+		fn, _ := tool["function"].(map[string]any)
+		if name, _ := fn["name"].(string); name != "" {
+			result[name] = true
+		}
+	}
+	return result
+}
+
 func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, in map[string]any, custom map[string]bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	id, itemID := protocolID("resp_"), protocolID("msg_")
@@ -235,26 +268,34 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 	base := map[string]any{"id": id, "object": "response", "created_at": created, "status": "in_progress", "model": in["model"], "output": []any{}, "parallel_tool_calls": true, "error": nil, "incomplete_details": nil}
 	sseEmit(w, "response.created", map[string]any{"type": "response.created", "response": base})
 	state := newChatStreamParser()
-	started := false
-	outputOffset := 0
+	knownTools := declaredToolNames(chat)
+	textStarted := false
+	textIndex := -1
+	nextIndex := 0
 	state.onText = func(delta string) {
-		if !started {
-			started = true
-			outputOffset = 1
+		if !textStarted {
+			textStarted = true
+			textIndex = nextIndex
+			nextIndex++
 			item := map[string]any{"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}
-			sseEmit(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
-			sseEmit(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": itemID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
+			sseEmit(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": textIndex, "item": item})
+			sseEmit(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": itemID, "output_index": textIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
 		}
-		sseEmit(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": itemID, "output_index": 0, "content_index": 0, "delta": delta})
+		sseEmit(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": itemID, "output_index": textIndex, "content_index": 0, "delta": delta})
 	}
 	state.onTool = func(tool *streamTool, delta string) {
 		name := tool.name.String()
-		if name == "" || tool.id == "" {
+		// Name-only fragments are buffered. The first argument fragment is the
+		// earliest point at which Chat SSE has finished spelling the name.
+		if name == "" || tool.id == "" || len(knownTools) > 0 && !knownTools[name] || delta == "" && tool.arguments.Len() == 0 {
 			return
 		}
-		index := outputOffset + tool.order
+		emitDelta := delta
 		if !tool.started {
+			tool.eventIndex = nextIndex
+			nextIndex++
 			tool.started = true
+			emitDelta = tool.arguments.String()
 			typ := "function_call"
 			item := map[string]any{"id": protocolID("fc_"), "type": typ, "status": "in_progress", "call_id": tool.id, "name": name, "arguments": ""}
 			if custom[name] {
@@ -264,10 +305,10 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 				item["input"] = ""
 			}
 			item["id"] = fmt.Sprintf("fc_%s", tool.id)
-			sseEmit(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": index, "item": item})
+			sseEmit(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": tool.eventIndex, "item": item})
 		}
-		if delta != "" && !custom[name] {
-			sseEmit(w, "response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "item_id": fmt.Sprintf("fc_%s", tool.id), "output_index": index, "delta": delta})
+		if emitDelta != "" && !custom[name] {
+			sseEmit(w, "response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "item_id": fmt.Sprintf("fc_%s", tool.id), "output_index": tool.eventIndex, "delta": emitDelta})
 		}
 	}
 	bridge := &chatSSEBridge{dst: w}
@@ -292,15 +333,20 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 		return
 	}
 	text := state.text.String()
-	output := []any{}
-	if started {
+	outputByIndex := map[int]any{}
+	if textStarted {
 		item := map[string]any{"id": itemID, "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
-		sseEmit(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": itemID, "output_index": 0, "content_index": 0, "text": text})
-		sseEmit(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
-		output = append(output, item)
+		sseEmit(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": itemID, "output_index": textIndex, "content_index": 0, "text": text})
+		sseEmit(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": textIndex, "item": item})
+		outputByIndex[textIndex] = item
 	}
 	for _, tool := range state.order {
-		name, args, index := tool.name.String(), tool.arguments.String(), outputOffset+tool.order
+		name, args := tool.name.String(), tool.arguments.String()
+		if tool.eventIndex < 0 {
+			tool.eventIndex = nextIndex
+			nextIndex++
+		}
+		index := tool.eventIndex
 		item := map[string]any{"id": fmt.Sprintf("fc_%s", tool.id), "type": "function_call", "status": "completed", "call_id": tool.id, "name": name, "arguments": args}
 		if custom[name] {
 			var wrapper map[string]any
@@ -315,7 +361,13 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 			sseEmit(w, "response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": index, "arguments": args})
 		}
 		sseEmit(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": index, "item": item})
-		output = append(output, item)
+		outputByIndex[index] = item
+	}
+	output := make([]any, 0, len(outputByIndex))
+	for i := 0; i < nextIndex; i++ {
+		if item, ok := outputByIndex[i]; ok {
+			output = append(output, item)
+		}
 	}
 	status := "completed"
 	var incomplete any
@@ -342,28 +394,34 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, chat, 
 	start := map[string]any{"id": id, "type": "message", "role": "assistant", "model": in["model"], "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{}}
 	sseEmit(w, "message_start", map[string]any{"type": "message_start", "message": start})
 	state := newChatStreamParser()
-	started := false
+	knownTools := declaredToolNames(chat)
+	textStarted := false
+	textIndex := -1
+	nextIndex := 0
 	state.onText = func(delta string) {
-		if !started {
-			started = true
-			sseEmit(w, "content_block_start", map[string]any{"type": "content_block_start", "index": 0, "content_block": map[string]any{"type": "text", "text": ""}})
+		if !textStarted {
+			textStarted = true
+			textIndex = nextIndex
+			nextIndex++
+			sseEmit(w, "content_block_start", map[string]any{"type": "content_block_start", "index": textIndex, "content_block": map[string]any{"type": "text", "text": ""}})
 		}
-		sseEmit(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": 0, "delta": map[string]any{"type": "text_delta", "text": delta}})
+		sseEmit(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": textIndex, "delta": map[string]any{"type": "text_delta", "text": delta}})
 	}
 	state.onTool = func(tool *streamTool, delta string) {
-		if tool.id == "" || tool.name.Len() == 0 {
+		name := tool.name.String()
+		if tool.id == "" || name == "" || len(knownTools) > 0 && !knownTools[name] || delta == "" && tool.arguments.Len() == 0 {
 			return
 		}
-		index := tool.order
-		if started {
-			index++
-		}
+		emitDelta := delta
 		if !tool.started {
+			tool.eventIndex = nextIndex
+			nextIndex++
 			tool.started = true
-			sseEmit(w, "content_block_start", map[string]any{"type": "content_block_start", "index": index, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name.String(), "input": map[string]any{}}})
+			emitDelta = tool.arguments.String()
+			sseEmit(w, "content_block_start", map[string]any{"type": "content_block_start", "index": tool.eventIndex, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name.String(), "input": map[string]any{}}})
 		}
-		if delta != "" {
-			sseEmit(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": index, "delta": map[string]any{"type": "input_json_delta", "partial_json": delta}})
+		if emitDelta != "" {
+			sseEmit(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": tool.eventIndex, "delta": map[string]any{"type": "input_json_delta", "partial_json": emitDelta}})
 		}
 	}
 	bridge := &chatSSEBridge{dst: w}
@@ -385,19 +443,21 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, chat, 
 		sseEmit(w, "error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": msg}})
 		return
 	}
-	if started {
-		sseEmit(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0})
+	if textStarted {
+		sseEmit(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": textIndex})
 	}
 	for _, tool := range state.order {
-		index := tool.order
-		if started {
-			index++
+		if tool.eventIndex < 0 {
+			tool.eventIndex = nextIndex
+			nextIndex++
 		}
-		sseEmit(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
+		sseEmit(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": tool.eventIndex})
 	}
 	reason := "end_turn"
 	if state.finish == "length" {
 		reason = "max_tokens"
+	} else if state.finish == "tool_calls" {
+		reason = "tool_use"
 	}
 	usage := anthropicUsage(state.usage)
 	sseEmit(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": reason, "stop_sequence": nil}, "usage": map[string]any{"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}})
