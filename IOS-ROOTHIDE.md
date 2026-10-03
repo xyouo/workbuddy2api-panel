@@ -71,7 +71,7 @@ requires_openai_auth = false
 supports_websockets = false
 ```
 
-启动前设置 `WORKBUDDY_API_KEY='<占位密钥>'`。实现支持文本、HTTP/data URL 图片、function tools、Codex 自由文本 custom tools（包括 Codex 0.160.0 使用的 grammar 格式；转换为带 `input` 字段的函数并可逆还原）、工具结果和 SSE。客户端必须在每次请求提交完整历史；`previous_response_id`、`background`、Responses WebSocket、`/responses/compact`、hosted tools和加密 reasoning/签名会明确返回错误，不会被静默忽略。流式文本增量在上游每次写入后同步转换并 Flush，不等待完整回复；取消沿原请求 context 传播，异常断流不会生成成功完成事件。
+启动前设置 `WORKBUDDY_API_KEY='<占位密钥>'`。实现支持文本、HTTP/data URL 图片、function tools、Codex 自由文本 custom tools（包括 Codex 0.160.0 使用的 grammar 格式；转换为带 `input` 字段的函数并可逆还原）、工具结果和 SSE。客户端必须在每次请求提交完整历史；`previous_response_id`、`background`、Responses WebSocket、`/responses/compact`、hosted tools和加密 reasoning/签名会明确返回错误，不会被静默忽略。流式文本及函数参数增量在上游每次写入后同步转换并 Flush；custom tool 的 JSON 包装只有在完整校验后才安全地解包为自由文本增量。取消沿原请求 context 传播，无效工具 JSON 和异常断流不会生成成功完成事件。
 
 ## Claude Code（第三方 Messages 适配）
 

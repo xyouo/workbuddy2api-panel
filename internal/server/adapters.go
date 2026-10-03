@@ -262,6 +262,49 @@ func chatOutput(chat map[string]any, custom map[string]bool) ([]any, string) {
 	return out, stop
 }
 
+func validateChatObjectTools(chat map[string]any, custom map[string]bool) error {
+	choices, _ := chat["choices"].([]any)
+	if len(choices) == 0 {
+		return nil
+	}
+	c, _ := choices[0].(map[string]any)
+	message, _ := c["message"].(map[string]any)
+	if message == nil {
+		message, _ = c["delta"].(map[string]any)
+	}
+	calls, _ := message["tool_calls"].([]any)
+	for _, raw := range calls {
+		call, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf("invalid upstream tool call")
+		}
+		fn, _ := call["function"].(map[string]any)
+		id, _ := call["id"].(string)
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		if name == "" || id == "" {
+			return fmt.Errorf("upstream tool call is missing id or name")
+		}
+		if args == "" {
+			return fmt.Errorf("tool %q has empty arguments", name)
+		}
+		var value any
+		if err := json.Unmarshal([]byte(args), &value); err != nil {
+			return fmt.Errorf("tool %q has invalid arguments JSON: %w", name, err)
+		}
+		if custom[name] {
+			obj, ok := value.(map[string]any)
+			if !ok {
+				return fmt.Errorf("custom tool %q arguments must be an object", name)
+			}
+			if _, ok := obj["input"].(string); !ok {
+				return fmt.Errorf("custom tool %q arguments require string input", name)
+			}
+		}
+	}
+	return nil
+}
+
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	var in map[string]any
 	if json.NewDecoder(r.Body).Decode(&in) != nil {
@@ -302,6 +345,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 		adapterError(w, 502, "upstream_error", "invalid upstream response")
 		return
 	}
+	if err := validateChatObjectTools(obj, custom); err != nil {
+		adapterError(w, 502, "upstream_error", err.Error())
+		return
+	}
 	output, _ := chatOutput(obj, custom)
 	_, state := chatOutput(obj, custom)
 	var incomplete any
@@ -327,114 +374,25 @@ func responsesUsage(v any) any {
 	return map[string]any{"input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"], "total_tokens": u["total_tokens"]}
 }
 func aggregateChatSSE(s string) map[string]any {
-	text := ""
-	tools := map[int]map[string]any{}
-	var usage any
-	finish := ""
-	done := false
-	var streamErr any
-	nextFallback := 0
+	parser := newChatStreamParser()
 	for _, line := range strings.Split(s, "\n") {
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-		if payload == "[DONE]" {
-			done = true
-			continue
-		}
-		var v map[string]any
-		if json.Unmarshal([]byte(payload), &v) != nil {
-			streamErr = map[string]any{"message": "invalid upstream SSE JSON"}
-			continue
-		}
-		if v["error"] != nil {
-			streamErr = v["error"]
-			continue
-		}
-		if v["usage"] != nil {
-			usage = v["usage"]
-		}
-		cs, _ := v["choices"].([]any)
-		if len(cs) == 0 {
-			continue
-		}
-		c, _ := cs[0].(map[string]any)
-		if x, ok := c["finish_reason"].(string); ok && x != "" {
-			finish = x
-		}
-		d, _ := c["delta"].(map[string]any)
-		if x, ok := d["content"].(string); ok {
-			text += x
-		}
-		if a, ok := d["tool_calls"].([]any); ok {
-			for _, raw := range a {
-				t, ok := raw.(map[string]any)
-				if !ok {
-					streamErr = map[string]any{"message": "invalid tool delta"}
-					continue
-				}
-				idx := -1
-				switch n := t["index"].(type) {
-				case float64:
-					idx = int(n)
-				case json.Number:
-					q, _ := n.Int64()
-					idx = int(q)
-				}
-				if idx < 0 {
-					if id, _ := t["id"].(string); id != "" {
-						for k, z := range tools {
-							if z["id"] == id {
-								idx = k
-								break
-							}
-						}
-					}
-					if idx < 0 {
-						idx = nextFallback
-						for tools[idx] != nil {
-							idx++
-						}
-						nextFallback = idx + 1
-					}
-				}
-				z := tools[idx]
-				if z == nil {
-					z = map[string]any{"function": map[string]any{}}
-					tools[idx] = z
-				}
-				if x, ok := t["id"].(string); ok {
-					z["id"] = x
-				}
-				f, _ := t["function"].(map[string]any)
-				zf, _ := z["function"].(map[string]any)
-				if zf == nil {
-					zf = map[string]any{}
-					z["function"] = zf
-				}
-				if x, ok := f["name"].(string); ok {
-					old, _ := zf["name"].(string)
-					zf["name"] = old + x
-				}
-				if x, ok := f["arguments"].(string); ok {
-					old, _ := zf["arguments"].(string)
-					zf["arguments"] = old + x
-				}
-			}
-		}
+		parser.consume(strings.TrimSpace(strings.TrimPrefix(line, "data: ")))
 	}
 	a := []any{}
-	keys := make([]int, 0, len(tools))
-	for i := range tools {
-		keys = append(keys, i)
+	tools := append([]*streamTool(nil), parser.order...)
+	sort.SliceStable(tools, func(i, j int) bool { return tools[i].index < tools[j].index })
+	for _, tool := range tools {
+		a = append(a, map[string]any{"id": tool.id, "type": "function", "function": map[string]any{"name": tool.name.String(), "arguments": tool.arguments.String()}})
 	}
-	sort.Ints(keys)
-	for _, i := range keys {
-		a = append(a, tools[i])
+	var streamErr any
+	if parser.failed != "" {
+		streamErr = map[string]any{"message": parser.failed}
 	}
-	m := map[string]any{"content": text, "tool_calls": a}
-	return map[string]any{"choices": []any{map[string]any{"message": m, "finish_reason": finish}}, "usage": usage, "stream_done": done, "stream_error": streamErr}
+	m := map[string]any{"content": parser.text.String(), "tool_calls": a}
+	return map[string]any{"choices": []any{map[string]any{"message": m, "finish_reason": parser.finish}}, "usage": parser.usage, "stream_done": parser.done, "stream_error": streamErr}
 }
 
 func anthropicToChat(in map[string]any) (map[string]any, error) {
@@ -621,6 +579,10 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	obj, err := chatObject(rr)
 	if err != nil {
 		writeAnthropicError(w, 502, "invalid upstream response")
+		return
+	}
+	if err := validateChatObjectTools(obj, map[string]bool{}); err != nil {
+		writeAnthropicError(w, 502, err.Error())
 		return
 	}
 	blocks, reason := anthropicBlocks(obj)
