@@ -364,14 +364,42 @@ func stripToolCallNames(obj map[string]any, seen map[string]string) {
 			if tc == nil {
 				continue
 			}
-			key := ""
+			indexKey, idKey := "", ""
 			if v, ok := tc["index"].(float64); ok {
-				key = fmt.Sprintf("index:%d", int(v))
-			} else if id, _ := tc["id"].(string); id != "" {
-				key = "id:" + id
+				indexKey = fmt.Sprintf("index:%d", int(v))
+			}
+			if id, _ := tc["id"].(string); id != "" {
+				idKey = "id:" + id
+			}
+			resolve := func(key string) string {
+				if alias := seen["alias:"+key]; alias != "" {
+					return alias
+				}
+				return key
+			}
+			key := indexKey
+			if key == "" {
+				key = idKey
 			}
 			if key == "" {
 				key = "implicit:0"
+			}
+			key = resolve(key)
+			// When a frame carries both forms, bind them to the already-known
+			// identity (if either exists), then retain the association for frames
+			// that later omit index or ID.
+			if indexKey != "" && idKey != "" {
+				resolvedIndex, resolvedID := resolve(indexKey), resolve(idKey)
+				switch {
+				case seen[resolvedIndex] != "":
+					key = resolvedIndex
+				case seen[resolvedID] != "":
+					key = resolvedID
+				default:
+					key = resolvedIndex
+				}
+				seen["alias:"+indexKey] = key
+				seen["alias:"+idKey] = key
 			}
 			fn, _ := tc["function"].(map[string]any)
 			if fn == nil {

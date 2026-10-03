@@ -547,3 +547,78 @@ func TestResponsesHTTPFragmentedCustomToolName(t *testing.T) {
 		}
 	}
 }
+
+func TestAdapterHTTPToolIdentitySwitchesBetweenIndexAndID(t *testing.T) {
+	streams := []struct{ name, first, second string }{
+		{"index-to-id", `{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":"{"}}`, `{"id":"call_a","function":{"name":"read","arguments":"}"}}`},
+		{"id-to-index", `{"id":"call_a","type":"function","function":{"name":"read","arguments":"{"}}`, `{"index":0,"id":"call_a","function":{"name":"read","arguments":"}"}}`},
+	}
+	protocols := []struct {
+		name, path, request string
+		headers             map[string]string
+	}{
+		{"responses", "/v1/responses", `{"model":"glm-5.2","stream":true,"input":"read","tools":[{"type":"function","name":"read","parameters":{"type":"object"}}]}`, nil},
+		{"anthropic", "/v1/messages", `{"model":"glm-5.2","stream":true,"max_tokens":20,"messages":[{"role":"user","content":"read"}],"tools":[{"name":"read","input_schema":{"type":"object"}}]}`, map[string]string{"anthropic-version": "2023-06-01"}},
+	}
+	for _, stream := range streams {
+		for _, protocol := range protocols {
+			t.Run(protocol.name+"/"+stream.name, func(t *testing.T) {
+				upstreamBody := strings.Join([]string{
+					`data: {"choices":[{"delta":{"tool_calls":[` + stream.first + `]}}]}`,
+					`data: {"choices":[{"delta":{"tool_calls":[` + stream.second + `]}}]}`,
+					`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`,
+					`data: [DONE]`, "",
+				}, "\n\n")
+				body := runAdapterStream(t, protocol.path, protocol.request, upstreamBody, protocol.headers)
+				if strings.Contains(body, `"type":"error"`) || strings.Contains(body, `response.failed`) {
+					t.Fatalf("identity switch failed stream: %s", body)
+				}
+				events := streamDataObjects(t, body)
+				starts, indexes := 0, map[int]bool{}
+				arguments := ""
+				for _, event := range events {
+					if protocol.name == "responses" {
+						if event["type"] == "response.output_item.added" {
+							if item, _ := event["item"].(map[string]any); item["call_id"] == "call_a" {
+								starts++
+								indexes[int(event["output_index"].(float64))] = true
+							}
+						}
+						if strings.Contains(fmt.Sprint(event["item_id"]), "call_a") {
+							if n, ok := event["output_index"].(float64); ok {
+								indexes[int(n)] = true
+							}
+						}
+						if event["type"] == "response.function_call_arguments.done" {
+							arguments, _ = event["arguments"].(string)
+						}
+					} else {
+						if event["type"] == "content_block_start" {
+							block, _ := event["content_block"].(map[string]any)
+							if block["id"] == "call_a" {
+								starts++
+								indexes[int(event["index"].(float64))] = true
+								if block["name"] != "read" {
+									t.Fatalf("name=%v", block["name"])
+								}
+							}
+						}
+						if event["type"] == "content_block_delta" {
+							delta, _ := event["delta"].(map[string]any)
+							if part, _ := delta["partial_json"].(string); part != "" {
+								arguments += part
+								indexes[int(event["index"].(float64))] = true
+							}
+						}
+					}
+				}
+				if starts != 1 || len(indexes) != 1 || arguments != "{}" {
+					t.Fatalf("starts=%d indexes=%v arguments=%q\n%s", starts, indexes, arguments, body)
+				}
+				if !strings.Contains(body, `"name":"read"`) || protocol.name == "responses" && !strings.Contains(body, `"type":"response.completed"`) || protocol.name == "anthropic" && !strings.Contains(body, `"stop_reason":"tool_use"`) {
+					t.Fatalf("bad terminal tool event: %s", body)
+				}
+			})
+		}
+	}
+}

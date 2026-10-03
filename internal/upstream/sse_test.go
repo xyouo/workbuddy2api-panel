@@ -225,6 +225,38 @@ func TestStripToolCallNames(t *testing.T) {
 	}
 }
 
+func TestStripToolCallNamesLinksIndexAndID(t *testing.T) {
+	frame := func(index any, id, name, arguments string) map[string]any {
+		call := map[string]any{"id": id, "function": map[string]any{"name": name, "arguments": arguments}}
+		if index != nil {
+			call["index"] = index
+		}
+		return map[string]any{"choices": []any{map[string]any{"delta": map[string]any{"tool_calls": []any{call}}}}}
+	}
+	fn := func(value map[string]any) map[string]any {
+		return value["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	}
+	for _, tc := range []struct {
+		name          string
+		first, second map[string]any
+	}{
+		{"index-to-id", frame(float64(0), "call_a", "read", "{"), frame(nil, "call_a", "read", "}")},
+		{"id-to-index", frame(nil, "call_a", "read", "{"), frame(float64(0), "call_a", "read", "}")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seen := map[string]string{}
+			stripToolCallNames(tc.first, seen)
+			stripToolCallNames(tc.second, seen)
+			if _, ok := fn(tc.second)["name"]; ok {
+				t.Fatalf("duplicate name passed after identity form switch: %#v", fn(tc.second))
+			}
+			if fn(tc.first)["arguments"] != "{" || fn(tc.second)["arguments"] != "}" {
+				t.Fatal("arguments changed")
+			}
+		})
+	}
+}
+
 // TestStreamToolCallNameOnce 11 帧 tool_call：首帧 name=Bash，后续 10 帧不得携带
 // name 键，arguments 逐帧原样透传（issue #82：累加型客户端把每个分片 name 拼接成
 // Bash×帧数；正确行为是 name 只在首帧出现一次）。
