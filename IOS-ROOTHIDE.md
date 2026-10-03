@@ -49,6 +49,57 @@ OAuth、模型列表、聊天及流式响应测试后，才能增加 `.deb`。�
 - 静态检查通过：只有 `verify-ios-artifact.sh` 的全部检查成功才成立。
 - 真机运行成功：目前**不成立，待真机验证**。
 
-推送 `work`、`ios-roothide` 或 `ios-roothide/**` 分支会自动运行构建；也可在 Actions
-页面手动运行。`ios-v*` tag 在构建及归档校验通过后会发布标记为 prerelease 的 Release，
+相关 PR 与 `main` push 会自动运行构建；也可在 Actions 页面手动运行。`ios-v*` tag
+在构建及归档校验通过后会发布标记为 prerelease 的 Release，
 上传压缩包和 `SHA256SUMS`。这不改变“待真机验证”的状态，也不会生成未验证的 `.deb`。
+
+## Codex CLI 0.160.0（第三方 Responses 适配）
+
+本项目不是 OpenAI 官方服务；它把 Responses 请求无状态转换为 WorkBuddy 上游实际支持的 Chat Completions。先从 `GET /v1/models` 选择真实返回的模型 ID，不要把其他模型冒充为 OpenAI 模型。`~/.codex/config.toml` 最小示例：
+
+```toml
+model = "cn:<GET-/v1/models-返回的模型>"
+model_provider = "workbuddy"
+model_reasoning_summary = "none"
+
+[model_providers.workbuddy]
+name = "WorkBuddy2API third-party adapter"
+base_url = "http://<PHONE-IP>:8080/v1"
+env_key = "WORKBUDDY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+```
+
+启动前设置 `WORKBUDDY_API_KEY='<占位密钥>'`。实现支持文本、HTTP/data URL 图片、function tools、Codex 自由文本 custom tools（转换为带 `input` 字段的函数并可逆还原）、工具结果和 SSE。客户端必须在每次请求提交完整历史；`previous_response_id`、`background`、Responses WebSocket、`/responses/compact`、hosted tools、加密 reasoning/签名和 grammar custom tool 会明确返回错误，不会被静默忽略。流式适配会等待上游 Chat SSE 完成后再发 Responses 事件，因此不是低延迟逐 token 转发。
+
+## Claude Code（第三方 Messages 适配）
+
+```sh
+export ANTHROPIC_BASE_URL='http://<PHONE-IP>:8080'
+export ANTHROPIC_AUTH_TOKEN='<占位密钥>'
+export ANTHROPIC_MODEL='cn:<GET-/v1/models-返回的模型>'
+claude
+```
+
+路由是 `${ANTHROPIC_BASE_URL}/v1/messages`，包括 Claude Code 常见的 `?beta=true`；接受 `x-api-key` 或 Bearer。支持 system、文本、HTTP/base64 图片、tools/input_schema、tool_use/tool_result、多工具及 Messages SSE。`anthropic-version` 必填；未知 `anthropic-beta` 值被视为客户端声明而非能力承诺。thinking/signature、prompt caching、context management 和非文本 tool_result 会明确报错。`/v1/messages/count_tokens` 返回 501，而不伪造精确 token 数；Claude Code 应使用自身的上下文估算并直接发送 Messages 请求。协议可连接不表示 Anthropic 官方支持或全部 Claude 功能兼容。
+
+两种客户端都建议先开新会话做文本与一次工具闭环，再迁移工作；修改旧会话 provider 只改变后续网络目的地，不会转换旧历史，也不能保证目标模型理解旧模型历史。
+
+## CI、Artifact 与发布
+
+* “iOS 构建”：相关 PR 与 `main` push 自动测试、`go vet`、使用真实 iPhoneOS SDK 编译并上传 Artifact；`workflow_dispatch` 可手动运行。`ios-v*` tag 从 tag 提交重复全部步骤并创建 prerelease。
+* “Docker 构建（手动）”和“其他平台构建（手动）”：仅 `workflow_dispatch`；`publish=false`（默认）只构建，明确选择 `publish=true` 才发布。
+* iOS Artifact 名为 `workbuddy2api-panel-ios-arm64`，内含 `workbuddy2api-panel-ios-arm64.tar.gz` 与 `SHA256SUMS`。归档仅含程序、示例配置、许可证、本文和 `BUILD-INFO.txt`。
+
+下载后先执行 `shasum -a 256 -c SHA256SUMS`，解包并按 RootHide 环境使用你信任的本地签名工具重新签名，再以前台方式 `./wb2api -config ./config.ios.example.json` 验证，停止用 `Ctrl-C`。CI 的 adhoc 签名不保证真机直接启动；不要硬编码 `.jbroot`，本项目尚未验证 libvroot 路径重定向，也不提供 arm64e 或 `.deb`。最低部署目标为 iOS 15.0（兼容目标设备 iOS 15.5），新产物仍须真机验证。
+
+### 可复现的本地协议检查
+
+```sh
+go test ./...
+go vet ./...
+GOOS=ios GOARCH=arm64 CGO_ENABLED=1 go build ./cmd/server # 需 macOS + iPhoneOS SDK/clang；CI 使用完整命令
+```
+
+测试使用合成账号和 mock HTTP 上游，验证转换、SSE 聚合、工具关联及既有 Chat Completions 回归；它不是实际 Codex/Claude 登录、生产账号或 iOS 真机验证。

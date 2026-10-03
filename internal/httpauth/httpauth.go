@@ -28,9 +28,9 @@ func VerifyBearer(r *http.Request, key string) bool {
 	}
 	authz := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authz, bearerPrefix) {
-		// 缺头/方案不对：仍走一次摘要比较，保持耗时形状一致。
-		subtle.ConstantTimeCompare(digest(""), digest(key))
-		return false
+		// Anthropic SDKs and Claude Code use x-api-key. Accept it with the
+		// same constant-time comparison while retaining Bearer compatibility.
+		return subtle.ConstantTimeCompare(digest(r.Header.Get("x-api-key")), digest(key)) == 1
 	}
 	tok := authz[len(bearerPrefix):]
 	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
