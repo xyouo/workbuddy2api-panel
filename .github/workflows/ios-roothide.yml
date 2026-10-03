@@ -1,4 +1,4 @@
-name: ios-roothide
+name: iOS 构建
 
 on:
   pull_request:
@@ -7,15 +7,15 @@ on:
       - "go.sum"
       - "cmd/**"
       - "internal/**"
-      - "config.ios.example.json"
+      - "config*.json"
+      - "*.md"
+      - "LICENSE"
       - "scripts/verify-ios-artifact.sh"
       - ".github/workflows/ios-roothide.yml"
   workflow_dispatch:
   push:
     branches:
-      - work
-      - ios-roothide
-      - "ios-roothide/**"
+      - main
     tags: ["ios-v*"]
 
 permissions:
@@ -51,6 +51,8 @@ jobs:
           xcrun --sdk iphoneos --find ld
       - name: Test
         run: go test ./...
+      - name: Static checks
+        run: go vet ./...
       - name: Build genuine iOS arm64 Mach-O
         shell: bash
         run: |
@@ -70,9 +72,10 @@ jobs:
           MIN_IOS_VERSION="$IOS_DEPLOYMENT_TARGET" scripts/verify-ios-artifact.sh dist/wb2api
       - name: Assemble privacy-limited archive and checksums
         run: |
+          printf 'commit=%s\nupstream=%s\ngo=%s\nminimum_ios=%s\nversion=%s\n' "$GITHUB_SHA" "$UPSTREAM_COMMIT" "$(go version)" "$IOS_DEPLOYMENT_TARGET" "$(grep -oE 'appVersion = "[^"]+' cmd/server/main.go | cut -d'"' -f2)" > dist/BUILD-INFO.txt
           cp config.ios.example.json LICENSE IOS-ROOTHIDE.md dist/
           tar -C dist -czf workbuddy2api-panel-ios-arm64.tar.gz \
-            wb2api config.ios.example.json IOS-ROOTHIDE.md LICENSE
+            wb2api config.ios.example.json IOS-ROOTHIDE.md LICENSE BUILD-INFO.txt
           shasum -a 256 workbuddy2api-panel-ios-arm64.tar.gz > SHA256SUMS
           tar -tzf workbuddy2api-panel-ios-arm64.tar.gz
       - uses: actions/upload-artifact@v4
