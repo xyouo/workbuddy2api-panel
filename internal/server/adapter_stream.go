@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 )
 
 // chatSSEBridge consumes the Chat Completions byte stream synchronously.  It
@@ -14,12 +16,11 @@ import (
 // applies backpressure to the upstream write, and request cancellation remains
 // on the original request context.
 type chatSSEBridge struct {
-	dst       http.ResponseWriter
 	header    http.Header
 	status    int
 	line      bytes.Buffer
 	errorBody bytes.Buffer
-	onData    func(string)
+	onData    func(string) error
 }
 
 func (b *chatSSEBridge) Header() http.Header {
@@ -53,28 +54,43 @@ func (b *chatSSEBridge) Write(p []byte) (int, error) {
 		b.line.Reset()
 		_, _ = b.line.Write(rest)
 		if strings.HasPrefix(line, "data:") {
-			b.onData(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			if err := b.onData(strings.TrimSpace(strings.TrimPrefix(line, "data:"))); err != nil {
+				return 0, err
+			}
 		}
 	}
 	return len(p), nil
 }
-func (b *chatSSEBridge) Flush() {
-	if f, ok := b.dst.(http.Flusher); ok {
-		f.Flush()
-	}
+
+// Each converted event flushes itself; flushing the bridge must not open an
+// otherwise empty or failed HTTP response before its status is known.
+func (b *chatSSEBridge) Flush() {}
+
+type adapterEventWriter struct {
+	w   http.ResponseWriter
+	err error
 }
 
-func sseEmit(w http.ResponseWriter, typ string, value any) {
-	b, _ := json.Marshal(value)
-	fmt.Fprintf(w, "event: %s\ndata: %s\n\n", typ, b)
-	if f, ok := w.(http.Flusher); ok {
+func (e *adapterEventWriter) emit(typ string, value any) {
+	if e.err != nil {
+		return
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		e.err = err
+		return
+	}
+	_, e.err = fmt.Fprintf(e.w, "event: %s\ndata: %s\n\n", typ, b)
+	if e.err != nil {
+		return
+	}
+	if f, ok := e.w.(http.Flusher); ok {
 		f.Flush()
 	}
 }
 
 type streamTool struct {
 	index      int
-	order      int
 	id         string
 	name       strings.Builder
 	arguments  strings.Builder
@@ -83,19 +99,21 @@ type streamTool struct {
 }
 
 type chatStreamParser struct {
-	text         strings.Builder
-	finish       string
-	usage        any
-	done         bool
-	failed       string
-	tools        map[int]*streamTool
-	order        []*streamTool
-	nextFallback int
-	onText       func(string)
-	onTool       func(*streamTool, string)
+	text   strings.Builder
+	finish string
+	usage  any
+	done   bool
+	failed string
+	tools  map[int]*streamTool
+	byID   map[string]*streamTool
+	order  []*streamTool
+	onText func(string)
+	onTool func(*streamTool, string)
 }
 
-func newChatStreamParser() *chatStreamParser { return &chatStreamParser{tools: map[int]*streamTool{}} }
+func newChatStreamParser() *chatStreamParser {
+	return &chatStreamParser{tools: map[int]*streamTool{}, byID: map[string]*streamTool{}}
+}
 
 func (s *chatStreamParser) fail(message string) {
 	if s.failed == "" {
@@ -103,41 +121,49 @@ func (s *chatStreamParser) fail(message string) {
 	}
 }
 
-func (s *chatStreamParser) toolIndex(raw map[string]any) int {
-	if n, ok := raw["index"].(float64); ok && n >= 0 {
-		return int(n)
+// Explicit indexes and call IDs are aliases, not separate tool records.
+// Fallback-only tools never occupy an explicit index that may appear later.
+func (s *chatStreamParser) toolForDelta(raw map[string]any) *streamTool {
+	id, _ := raw["id"].(string)
+	n, indexed := raw["index"].(float64)
+	indexed = indexed && n >= 0 && n == float64(int(n))
+	var tool *streamTool
+	if indexed {
+		tool = s.tools[int(n)]
 	}
-	if id, _ := raw["id"].(string); id != "" {
-		for index, tool := range s.tools {
-			if tool.id == id {
-				return index
-			}
+	if known := s.byID[id]; id != "" && known != nil {
+		if tool != nil && tool != known {
+			s.fail("conflicting tool call identity")
+			return nil
 		}
-		// A previously unseen explicit ID always denotes a new call. Never merge it
-		// into the sole existing tool merely because index was omitted.
-		index := s.nextFallback
-		for s.tools[index] != nil {
-			index++
-		}
-		s.nextFallback = index + 1
-		return index
+		tool = known
 	}
-	// A continuation without index/id is unambiguous only when one tool exists.
-	if len(s.tools) == 1 {
-		for index := range s.tools {
-			return index
+	if !indexed && id == "" {
+		if len(s.order) > 1 {
+			s.fail("tool delta without index or id is ambiguous")
+			return nil
+		}
+		if len(s.order) == 1 {
+			tool = s.order[0]
 		}
 	}
-	if len(s.tools) > 1 {
-		s.fail("tool delta without index or id is ambiguous")
-		return -1
+	if tool == nil {
+		tool = &streamTool{index: len(s.order), eventIndex: -1}
+		s.order = append(s.order, tool)
 	}
-	index := s.nextFallback
-	for s.tools[index] != nil {
-		index++
+	if id != "" {
+		if tool.id != "" && tool.id != id {
+			s.fail("conflicting tool call id")
+			return nil
+		}
+		tool.id = id
+		s.byID[id] = tool
 	}
-	s.nextFallback = index + 1
-	return index
+	if indexed {
+		s.tools[int(n)] = tool
+		tool.index = int(n)
+	}
+	return tool
 }
 
 func (s *chatStreamParser) consume(payload string) {
@@ -188,22 +214,9 @@ func (s *chatStreamParser) consume(payload string) {
 				s.fail("invalid upstream tool delta")
 				continue
 			}
-			index := s.toolIndex(raw)
-			if index < 0 {
-				continue
-			}
-			tool := s.tools[index]
+			tool := s.toolForDelta(raw)
 			if tool == nil {
-				tool = &streamTool{index: index, order: len(s.order), eventIndex: -1}
-				s.tools[index] = tool
-				s.order = append(s.order, tool)
-			}
-			if id, ok := raw["id"].(string); ok && id != "" {
-				if tool.id != "" && tool.id != id {
-					s.fail("conflicting tool call id")
-				} else {
-					tool.id = id
-				}
+				continue
 			}
 			fn, _ := raw["function"].(map[string]any)
 			if name, ok := fn["name"].(string); ok {
@@ -224,25 +237,9 @@ func (s *chatStreamParser) consume(payload string) {
 
 func (s *chatStreamParser) validateTools(custom map[string]bool) error {
 	for _, tool := range s.order {
-		if tool.id == "" || tool.name.Len() == 0 {
-			return fmt.Errorf("upstream tool call is missing id or name")
-		}
-		args := tool.arguments.String()
-		if args == "" {
-			return fmt.Errorf("tool %q has empty arguments", tool.name.String())
-		}
-		var value any
-		if err := json.Unmarshal([]byte(args), &value); err != nil {
-			return fmt.Errorf("tool %q has invalid arguments JSON: %w", tool.name.String(), err)
-		}
-		if custom[tool.name.String()] {
-			obj, ok := value.(map[string]any)
-			if !ok {
-				return fmt.Errorf("custom tool %q arguments must be an object", tool.name.String())
-			}
-			if _, ok := obj["input"].(string); !ok {
-				return fmt.Errorf("custom tool %q arguments require string input", tool.name.String())
-			}
+		name := tool.name.String()
+		if _, err := decodeToolArguments(tool.id, name, tool.arguments.String(), custom[name]); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -262,11 +259,15 @@ func declaredToolNames(chat map[string]any) map[string]bool {
 }
 
 func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, in map[string]any, custom map[string]bool) {
-	w.Header().Set("Content-Type", "text/event-stream")
+	events := &adapterEventWriter{w: w}
+	defer func() {
+		if events.err != nil {
+			setAdapterOutcome(r, http.StatusOK, reqlog.OutcomeInterrupted)
+		}
+	}()
 	id, itemID := protocolID("resp_"), protocolID("msg_")
-	created := timeNowUnix()
+	created := time.Now().Unix()
 	base := map[string]any{"id": id, "object": "response", "created_at": created, "status": "in_progress", "model": in["model"], "output": []any{}, "parallel_tool_calls": true, "error": nil, "incomplete_details": nil}
-	sseEmit(w, "response.created", map[string]any{"type": "response.created", "response": base})
 	state := newChatStreamParser()
 	knownTools := declaredToolNames(chat)
 	textStarted := false
@@ -278,10 +279,10 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 			textIndex = nextIndex
 			nextIndex++
 			item := map[string]any{"id": itemID, "type": "message", "status": "in_progress", "role": "assistant", "content": []any{}}
-			sseEmit(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": textIndex, "item": item})
-			sseEmit(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": itemID, "output_index": textIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
+			events.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": textIndex, "item": item})
+			events.emit("response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": itemID, "output_index": textIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}}})
 		}
-		sseEmit(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": itemID, "output_index": textIndex, "content_index": 0, "delta": delta})
+		events.emit("response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": itemID, "output_index": textIndex, "content_index": 0, "delta": delta})
 	}
 	state.onTool = func(tool *streamTool, delta string) {
 		name := tool.name.String()
@@ -297,27 +298,40 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 			tool.started = true
 			emitDelta = tool.arguments.String()
 			typ := "function_call"
-			item := map[string]any{"id": protocolID("fc_"), "type": typ, "status": "in_progress", "call_id": tool.id, "name": name, "arguments": ""}
+			item := map[string]any{"id": fmt.Sprintf("fc_%s", tool.id), "type": typ, "status": "in_progress", "call_id": tool.id, "name": name, "arguments": ""}
 			if custom[name] {
 				typ = "custom_tool_call"
 				item["type"] = typ
 				delete(item, "arguments")
 				item["input"] = ""
 			}
-			item["id"] = fmt.Sprintf("fc_%s", tool.id)
-			sseEmit(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": tool.eventIndex, "item": item})
+			events.emit("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": tool.eventIndex, "item": item})
 		}
 		if emitDelta != "" && !custom[name] {
-			sseEmit(w, "response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "item_id": fmt.Sprintf("fc_%s", tool.id), "output_index": tool.eventIndex, "delta": emitDelta})
+			events.emit("response.function_call_arguments.delta", map[string]any{"type": "response.function_call_arguments.delta", "item_id": fmt.Sprintf("fc_%s", tool.id), "output_index": tool.eventIndex, "delta": emitDelta})
 		}
 	}
-	bridge := &chatSSEBridge{dst: w}
-	bridge.onData = func(payload string) {
+	bridge := &chatSSEBridge{}
+	started := false
+	bridge.onData = func(payload string) error {
+		if !started {
+			started = true
+			copyAdapterHeaders(w, bridge.Header())
+			w.Header().Set("Content-Type", "text/event-stream")
+			events.emit("response.created", map[string]any{"type": "response.created", "response": base})
+		}
+		if events.err != nil {
+			return events.err
+		}
 		state.consume(payload)
+		return events.err
 	}
 	h.runChat(r, chat, bridge)
+	if events.err != nil {
+		return
+	}
 	if bridge.status != http.StatusOK {
-		sseEmit(w, "error", map[string]any{"type": "error", "error": map[string]any{"type": "upstream_error", "message": strings.TrimSpace(bridge.errorBody.String())}})
+		forwardAdapterError(w, bridge.status, bridge.Header(), bridge.errorBody.Bytes(), false)
 		return
 	}
 	if state.failed == "" {
@@ -329,15 +343,16 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 		if state.failed == "" {
 			state.failed = "upstream stream ended without a finish reason"
 		}
-		sseEmit(w, "response.failed", map[string]any{"type": "response.failed", "response": map[string]any{"id": id, "status": "failed", "error": map[string]any{"code": "upstream_error", "message": state.failed}}})
+		setAdapterOutcome(r, http.StatusBadGateway, reqlog.OutcomeStreamError)
+		events.emit("response.failed", map[string]any{"type": "response.failed", "response": map[string]any{"id": id, "status": "failed", "error": map[string]any{"code": "upstream_error", "message": state.failed}}})
 		return
 	}
 	text := state.text.String()
 	outputByIndex := map[int]any{}
 	if textStarted {
 		item := map[string]any{"id": itemID, "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}}}
-		sseEmit(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": itemID, "output_index": textIndex, "content_index": 0, "text": text})
-		sseEmit(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": textIndex, "item": item})
+		events.emit("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": itemID, "output_index": textIndex, "content_index": 0, "text": text})
+		events.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": textIndex, "item": item})
 		outputByIndex[textIndex] = item
 	}
 	for _, tool := range state.order {
@@ -355,12 +370,12 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 			item["type"] = "custom_tool_call"
 			item["input"] = input
 			delete(item, "arguments")
-			sseEmit(w, "response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "item_id": item["id"], "output_index": index, "delta": input})
-			sseEmit(w, "response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "item_id": item["id"], "output_index": index, "input": input})
+			events.emit("response.custom_tool_call_input.delta", map[string]any{"type": "response.custom_tool_call_input.delta", "item_id": item["id"], "output_index": index, "delta": input})
+			events.emit("response.custom_tool_call_input.done", map[string]any{"type": "response.custom_tool_call_input.done", "item_id": item["id"], "output_index": index, "input": input})
 		} else {
-			sseEmit(w, "response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": index, "arguments": args})
+			events.emit("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": item["id"], "output_index": index, "arguments": args})
 		}
-		sseEmit(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": index, "item": item})
+		events.emit("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": index, "item": item})
 		outputByIndex[index] = item
 	}
 	output := make([]any, 0, len(outputByIndex))
@@ -383,16 +398,20 @@ func (h *Handler) streamResponses(w http.ResponseWriter, r *http.Request, chat, 
 	if status == "incomplete" {
 		event = "response.incomplete"
 	}
-	sseEmit(w, event, map[string]any{"type": event, "response": resp})
+	events.emit(event, map[string]any{"type": event, "response": resp})
 }
 
 func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, chat, in map[string]any) {
-	w.Header().Set("Content-Type", "text/event-stream")
+	events := &adapterEventWriter{w: w}
+	defer func() {
+		if events.err != nil {
+			setAdapterOutcome(r, http.StatusOK, reqlog.OutcomeInterrupted)
+		}
+	}()
 	id := protocolID("msg_")
 	// Chat SSE reports usage in its terminal chunk. Do not fabricate zero input
 	// tokens in message_start; the observed values are emitted in message_delta.
 	start := map[string]any{"id": id, "type": "message", "role": "assistant", "model": in["model"], "content": []any{}, "stop_reason": nil, "stop_sequence": nil, "usage": map[string]any{}}
-	sseEmit(w, "message_start", map[string]any{"type": "message_start", "message": start})
 	state := newChatStreamParser()
 	knownTools := declaredToolNames(chat)
 	textStarted := false
@@ -403,9 +422,9 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, chat, 
 			textStarted = true
 			textIndex = nextIndex
 			nextIndex++
-			sseEmit(w, "content_block_start", map[string]any{"type": "content_block_start", "index": textIndex, "content_block": map[string]any{"type": "text", "text": ""}})
+			events.emit("content_block_start", map[string]any{"type": "content_block_start", "index": textIndex, "content_block": map[string]any{"type": "text", "text": ""}})
 		}
-		sseEmit(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": textIndex, "delta": map[string]any{"type": "text_delta", "text": delta}})
+		events.emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": textIndex, "delta": map[string]any{"type": "text_delta", "text": delta}})
 	}
 	state.onTool = func(tool *streamTool, delta string) {
 		name := tool.name.String()
@@ -418,50 +437,61 @@ func (h *Handler) streamAnthropic(w http.ResponseWriter, r *http.Request, chat, 
 			nextIndex++
 			tool.started = true
 			emitDelta = tool.arguments.String()
-			sseEmit(w, "content_block_start", map[string]any{"type": "content_block_start", "index": tool.eventIndex, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name.String(), "input": map[string]any{}}})
+			events.emit("content_block_start", map[string]any{"type": "content_block_start", "index": tool.eventIndex, "content_block": map[string]any{"type": "tool_use", "id": tool.id, "name": tool.name.String(), "input": map[string]any{}}})
 		}
 		if emitDelta != "" {
-			sseEmit(w, "content_block_delta", map[string]any{"type": "content_block_delta", "index": tool.eventIndex, "delta": map[string]any{"type": "input_json_delta", "partial_json": emitDelta}})
+			events.emit("content_block_delta", map[string]any{"type": "content_block_delta", "index": tool.eventIndex, "delta": map[string]any{"type": "input_json_delta", "partial_json": emitDelta}})
 		}
 	}
-	bridge := &chatSSEBridge{dst: w}
-	bridge.onData = state.consume
+	bridge := &chatSSEBridge{}
+	started := false
+	bridge.onData = func(payload string) error {
+		if !started {
+			started = true
+			copyAdapterHeaders(w, bridge.Header())
+			w.Header().Set("Content-Type", "text/event-stream")
+			events.emit("message_start", map[string]any{"type": "message_start", "message": start})
+		}
+		if events.err != nil {
+			return events.err
+		}
+		state.consume(payload)
+		return events.err
+	}
 	h.runChat(r, chat, bridge)
+	if events.err != nil {
+		return
+	}
 	if state.failed == "" {
 		if err := state.validateTools(map[string]bool{}); err != nil {
 			state.failed = err.Error()
 		}
 	}
-	if bridge.status != http.StatusOK || state.failed != "" || !state.done || state.finish == "" {
+	if bridge.status != http.StatusOK {
+		forwardAdapterError(w, bridge.status, bridge.Header(), bridge.errorBody.Bytes(), true)
+		return
+	}
+	if state.failed != "" || !state.done || state.finish == "" {
 		msg := state.failed
-		if bridge.status != http.StatusOK {
-			msg = strings.TrimSpace(bridge.errorBody.String())
-		}
 		if msg == "" {
 			msg = "upstream stream ended without a finish reason"
 		}
-		sseEmit(w, "error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": msg}})
+		setAdapterOutcome(r, http.StatusBadGateway, reqlog.OutcomeStreamError)
+		events.emit("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": msg}})
 		return
 	}
 	if textStarted {
-		sseEmit(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": textIndex})
+		events.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": textIndex})
 	}
 	for _, tool := range state.order {
 		if tool.eventIndex < 0 {
 			tool.eventIndex = nextIndex
 			nextIndex++
 		}
-		sseEmit(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": tool.eventIndex})
+		events.emit("content_block_stop", map[string]any{"type": "content_block_stop", "index": tool.eventIndex})
 	}
-	reason := "end_turn"
-	if state.finish == "length" {
-		reason = "max_tokens"
-	} else if state.finish == "tool_calls" {
-		reason = "tool_use"
-	}
+	reason := anthropicStopReason(state.finish, len(state.order) > 0)
 	usage := anthropicUsage(state.usage)
-	sseEmit(w, "message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": reason, "stop_sequence": nil}, "usage": map[string]any{"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}})
-	sseEmit(w, "message_stop", map[string]any{"type": "message_stop"})
+	events.emit("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": reason, "stop_sequence": nil}, "usage": map[string]any{"input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"]}})
+	events.emit("message_stop", map[string]any{"type": "message_stop"})
 }
-
-var timeNowUnix = func() int64 { return time.Now().Unix() }

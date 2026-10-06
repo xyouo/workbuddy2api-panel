@@ -12,9 +12,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 )
 
 func protocolID(prefix string) string {
@@ -52,6 +53,9 @@ func (h *Handler) runChat(r *http.Request, body map[string]any, w http.ResponseW
 	cr := r.Clone(r.Context())
 	cr.URL.Path = "/v1/chat/completions"
 	cr.Body = io.NopCloser(bytes.NewReader(b))
+	cr.ContentLength = int64(len(b))
+	cr.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
+	cr.Header.Set("Content-Type", "application/json")
 	h.chatCompletions(w, cr)
 }
 
@@ -67,7 +71,7 @@ func unsupported(obj map[string]any, keys ...string) (string, bool) {
 	return "", false
 }
 
-func responseContent(v any, output bool) any {
+func responseContent(v any) any {
 	if s, ok := v.(string); ok {
 		return s
 	}
@@ -93,10 +97,6 @@ func responseContent(v any, output bool) any {
 				}
 				out = append(out, q)
 			}
-		default:
-			if output {
-				continue
-			}
 		}
 	}
 	return out
@@ -116,7 +116,7 @@ func responsesToChat(in map[string]any) (map[string]any, error) {
 	if arr, ok := in["instructions"].([]any); ok {
 		for _, x := range arr {
 			if m, ok := x.(map[string]any); ok {
-				msgs = append(msgs, map[string]any{"role": m["role"], "content": responseContent(m["content"], false)})
+				msgs = append(msgs, map[string]any{"role": m["role"], "content": responseContent(m["content"])})
 			}
 		}
 	}
@@ -132,7 +132,7 @@ func responsesToChat(in map[string]any) (map[string]any, error) {
 			typ, _ := m["type"].(string)
 			switch typ {
 			case "message", "":
-				msgs = append(msgs, map[string]any{"role": m["role"], "content": responseContent(m["content"], false)})
+				msgs = append(msgs, map[string]any{"role": m["role"], "content": responseContent(m["content"])})
 			case "function_call", "custom_tool_call":
 				args := m["arguments"]
 				if typ == "custom_tool_call" {
@@ -221,18 +221,9 @@ func chatObject(rr *responseCapture) (map[string]any, error) {
 func chatOutput(chat map[string]any, custom map[string]bool) ([]any, string) {
 	out := []any{}
 	stop := "completed"
-	choices, _ := chat["choices"].([]any)
-	if len(choices) == 0 {
-		return out, stop
-	}
-	c, _ := choices[0].(map[string]any)
-	finish, _ := c["finish_reason"].(string)
+	m, finish := chatMessage(chat)
 	if finish == "length" {
 		stop = "incomplete"
-	}
-	m, _ := c["message"].(map[string]any)
-	if m == nil {
-		m, _ = c["delta"].(map[string]any)
 	}
 	if s, _ := m["content"].(string); s != "" {
 		out = append(out, map[string]any{"id": protocolID("msg_"), "type": "message", "status": "completed", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": s, "annotations": []any{}}}})
@@ -263,15 +254,7 @@ func chatOutput(chat map[string]any, custom map[string]bool) ([]any, string) {
 }
 
 func validateChatObjectTools(chat map[string]any, custom map[string]bool) error {
-	choices, _ := chat["choices"].([]any)
-	if len(choices) == 0 {
-		return nil
-	}
-	c, _ := choices[0].(map[string]any)
-	message, _ := c["message"].(map[string]any)
-	if message == nil {
-		message, _ = c["delta"].(map[string]any)
-	}
+	message, _ := chatMessage(chat)
 	calls, _ := message["tool_calls"].([]any)
 	for _, raw := range calls {
 		call, ok := raw.(map[string]any)
@@ -282,30 +265,16 @@ func validateChatObjectTools(chat map[string]any, custom map[string]bool) error 
 		id, _ := call["id"].(string)
 		name, _ := fn["name"].(string)
 		args, _ := fn["arguments"].(string)
-		if name == "" || id == "" {
-			return fmt.Errorf("upstream tool call is missing id or name")
-		}
-		if args == "" {
-			return fmt.Errorf("tool %q has empty arguments", name)
-		}
-		var value any
-		if err := json.Unmarshal([]byte(args), &value); err != nil {
-			return fmt.Errorf("tool %q has invalid arguments JSON: %w", name, err)
-		}
-		if custom[name] {
-			obj, ok := value.(map[string]any)
-			if !ok {
-				return fmt.Errorf("custom tool %q arguments must be an object", name)
-			}
-			if _, ok := obj["input"].(string); !ok {
-				return fmt.Errorf("custom tool %q arguments require string input", name)
-			}
+		if _, err := decodeToolArguments(id, name, args, custom[name]); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
+	r, finish := adapterRequest(r)
+	defer finish()
 	var in map[string]any
 	if json.NewDecoder(r.Body).Decode(&in) != nil {
 		adapterError(w, 400, "invalid_request_error", "invalid JSON")
@@ -333,24 +302,23 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	rr := &responseCapture{}
 	h.runChat(r, chat, rr)
 	if rr.status != 200 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(rr.status)
-		_, _ = w.Write(rr.body.Bytes())
+		forwardAdapterError(w, rr.status, rr.Header(), rr.body.Bytes(), false)
 		return
 	}
 	id := protocolID("resp_")
 	created := time.Now().Unix()
 	obj, err := chatObject(rr)
 	if err != nil {
+		setAdapterOutcome(r, 502, reqlog.OutcomeHTTPError)
 		adapterError(w, 502, "upstream_error", "invalid upstream response")
 		return
 	}
 	if err := validateChatObjectTools(obj, custom); err != nil {
+		setAdapterOutcome(r, 502, reqlog.OutcomeHTTPError)
 		adapterError(w, 502, "upstream_error", err.Error())
 		return
 	}
-	output, _ := chatOutput(obj, custom)
-	_, state := chatOutput(obj, custom)
+	output, state := chatOutput(obj, custom)
 	var incomplete any
 	if state == "incomplete" {
 		incomplete = map[string]any{"reason": "max_output_tokens"}
@@ -362,39 +330,10 @@ func (h *Handler) responses(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, resp)
 }
 
-func cloneMap(m map[string]any) map[string]any {
-	o := map[string]any{}
-	for k, v := range m {
-		o[k] = v
-	}
-	return o
-}
 func responsesUsage(v any) any {
 	u, _ := v.(map[string]any)
 	return map[string]any{"input_tokens": u["prompt_tokens"], "output_tokens": u["completion_tokens"], "total_tokens": u["total_tokens"]}
 }
-func aggregateChatSSE(s string) map[string]any {
-	parser := newChatStreamParser()
-	for _, line := range strings.Split(s, "\n") {
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		parser.consume(strings.TrimSpace(strings.TrimPrefix(line, "data: ")))
-	}
-	a := []any{}
-	tools := append([]*streamTool(nil), parser.order...)
-	sort.SliceStable(tools, func(i, j int) bool { return tools[i].index < tools[j].index })
-	for _, tool := range tools {
-		a = append(a, map[string]any{"id": tool.id, "type": "function", "function": map[string]any{"name": tool.name.String(), "arguments": tool.arguments.String()}})
-	}
-	var streamErr any
-	if parser.failed != "" {
-		streamErr = map[string]any{"message": parser.failed}
-	}
-	m := map[string]any{"content": parser.text.String(), "tool_calls": a}
-	return map[string]any{"choices": []any{map[string]any{"message": m, "finish_reason": parser.finish}}, "usage": parser.usage, "stream_done": parser.done, "stream_error": streamErr}
-}
-
 func anthropicToChat(in map[string]any) (map[string]any, error) {
 	if k, ok := unsupported(in, "thinking", "context_management"); ok {
 		return nil, fmt.Errorf("%s is not supported", k)
@@ -512,30 +451,25 @@ func anthropicToChat(in map[string]any) (map[string]any, error) {
 }
 
 func anthropicBlocks(chat map[string]any) ([]any, string) {
-	out, _ := chatOutput(chat, map[string]bool{})
+	message, finish := chatMessage(chat)
 	blocks := []any{}
-	reason := "end_turn"
-	if choices, _ := chat["choices"].([]any); len(choices) > 0 {
-		if c, _ := choices[0].(map[string]any); c["finish_reason"] == "length" {
-			reason = "max_tokens"
-		}
+	if text, _ := message["content"].(string); text != "" {
+		blocks = append(blocks, map[string]any{"type": "text", "text": text})
 	}
-	for _, raw := range out {
-		x := raw.(map[string]any)
-		if x["type"] == "message" {
-			c := x["content"].([]any)[0].(map[string]any)
-			blocks = append(blocks, map[string]any{"type": "text", "text": c["text"]})
-		} else {
-			var input any = map[string]any{}
-			_ = json.Unmarshal([]byte(fmt.Sprint(x["arguments"])), &input)
-			blocks = append(blocks, map[string]any{"type": "tool_use", "id": x["call_id"], "name": x["name"], "input": input})
-			reason = "tool_use"
-		}
+	calls, _ := message["tool_calls"].([]any)
+	for _, raw := range calls {
+		call, _ := raw.(map[string]any)
+		fn, _ := call["function"].(map[string]any)
+		id, _ := call["id"].(string)
+		name, _ := fn["name"].(string)
+		args, _ := fn["arguments"].(string)
+		input, _ := decodeToolArguments(id, name, args, false)
+		blocks = append(blocks, map[string]any{"type": "tool_use", "id": id, "name": name, "input": input})
 	}
 	if len(blocks) == 0 {
 		blocks = append(blocks, map[string]any{"type": "text", "text": ""})
 	}
-	return blocks, reason
+	return blocks, anthropicStopReason(finish, len(calls) > 0)
 }
 func anthropicUsage(v any) map[string]any {
 	u, _ := v.(map[string]any)
@@ -548,9 +482,11 @@ func numberOrZero(v any) any {
 	return v
 }
 func writeAnthropicError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": "invalid_request_error", "message": msg}})
+	writeJSON(w, status, map[string]any{"type": "error", "error": map[string]any{"type": anthropicErrorType(status), "message": msg}})
 }
 func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
+	r, finish := adapterRequest(r)
+	defer finish()
 	if r.Header.Get("anthropic-version") == "" {
 		writeAnthropicError(w, 400, "anthropic-version header is required")
 		return
@@ -573,15 +509,17 @@ func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	rr := &responseCapture{}
 	h.runChat(r, chat, rr)
 	if rr.status != 200 {
-		writeAnthropicError(w, rr.status, strings.TrimSpace(rr.body.String()))
+		forwardAdapterError(w, rr.status, rr.Header(), rr.body.Bytes(), true)
 		return
 	}
 	obj, err := chatObject(rr)
 	if err != nil {
+		setAdapterOutcome(r, 502, reqlog.OutcomeHTTPError)
 		writeAnthropicError(w, 502, "invalid upstream response")
 		return
 	}
 	if err := validateChatObjectTools(obj, map[string]bool{}); err != nil {
+		setAdapterOutcome(r, 502, reqlog.OutcomeHTTPError)
 		writeAnthropicError(w, 502, err.Error())
 		return
 	}

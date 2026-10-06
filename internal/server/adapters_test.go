@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -93,11 +92,11 @@ func TestAnthropicStreamEventOrder(t *testing.T) {
 func TestAnthropicAPIKeyAuth(t *testing.T) {
 	r := httptest.NewRequest("POST", "/v1/messages?beta=true", nil)
 	r.Header.Set("x-api-key", "synthetic-test-key")
-	if !httpauth.VerifyBearer(r, "synthetic-test-key") {
+	if !verifyAnthropicKey(r, "synthetic-test-key") {
 		t.Fatal("x-api-key rejected")
 	}
 	r.Header.Set("x-api-key", "wrong")
-	if httpauth.VerifyBearer(r, "synthetic-test-key") {
+	if verifyAnthropicKey(r, "synthetic-test-key") {
 		t.Fatal("wrong key accepted")
 	}
 }
@@ -621,4 +620,26 @@ func TestAdapterHTTPToolIdentitySwitchesBetweenIndexAndID(t *testing.T) {
 			})
 		}
 	}
+}
+
+func aggregateChatSSE(s string) map[string]any {
+	parser := newChatStreamParser()
+	for _, line := range strings.Split(s, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		parser.consume(strings.TrimSpace(strings.TrimPrefix(line, "data: ")))
+	}
+	a := []any{}
+	tools := append([]*streamTool(nil), parser.order...)
+	sort.SliceStable(tools, func(i, j int) bool { return tools[i].index < tools[j].index })
+	for _, tool := range tools {
+		a = append(a, map[string]any{"id": tool.id, "type": "function", "function": map[string]any{"name": tool.name.String(), "arguments": tool.arguments.String()}})
+	}
+	var streamErr any
+	if parser.failed != "" {
+		streamErr = map[string]any{"message": parser.failed}
+	}
+	m := map[string]any{"content": parser.text.String(), "tool_calls": a}
+	return map[string]any{"choices": []any{map[string]any{"message": m, "finish_reason": parser.finish}}, "usage": parser.usage, "stream_done": parser.done, "stream_error": streamErr}
 }

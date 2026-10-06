@@ -148,16 +148,6 @@ func NewHandler(cfg Config) *Handler {
 	return h
 }
 
-func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
-			writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid API key")
-			return
-		}
-		next(w, r)
-	}
-}
-
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses" || r.URL.Path == "/v1/messages") {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
@@ -551,7 +541,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
 	}
-	defer st.done()
+	defer finishChatStat(r, st)
 
 	tried := map[string]bool{}
 	var lastErr error
