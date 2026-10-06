@@ -13,8 +13,6 @@ services:
     user: "${PUID:-10001}:${PGID:-10001}"
     environment:
       - TZ=Asia/Shanghai
-      # 默认配置仅监听 loopback；容器发布端口必须显式监听所有容器接口。
-      - WB2A_LISTEN=:7863
     ports:
       - "7863:7863"
     volumes:

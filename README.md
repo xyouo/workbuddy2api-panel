@@ -230,7 +230,7 @@ mkdir -p auths data && cp config.example.json config.json
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api \
-  -p 7863:7863 -e TZ=Asia/Shanghai -e WB2A_LISTEN=:7863 \
+  -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
   ghcr.io/linguo2625469/workbuddy2api-panel:latest
 
@@ -345,6 +345,39 @@ curl -s http://localhost:7863/v1/chat/completions \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
+## Codex CLI 0.160.0（第三方 Responses 适配）
+
+本项目不是 OpenAI 官方服务；它把 Responses 请求无状态转换为 WorkBuddy 上游实际支持的 Chat Completions。先从 `GET /v1/models` 选择真实返回的模型 ID，不要把其他模型冒充为 OpenAI 模型。`~/.codex/config.toml` 最小示例：
+
+```toml
+model = "cn:<GET-/v1/models-返回的模型>"
+model_provider = "workbuddy"
+model_reasoning_summary = "none"
+
+[model_providers.workbuddy]
+name = "WorkBuddy2API third-party adapter"
+base_url = "http://127.0.0.1:7863/v1"
+env_key = "WORKBUDDY_API_KEY"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+```
+
+启动前设置 `WORKBUDDY_API_KEY='<占位密钥>'`。实现支持文本、HTTP/data URL 图片、function tools、Codex 自由文本 custom tools（包括 Codex 0.160.0 使用的 grammar 格式；转换为带 `input` 字段的函数并可逆还原）、工具结果和 SSE。客户端必须在每次请求提交完整历史；`previous_response_id`、`background`、Responses WebSocket、`/responses/compact`、hosted tools和加密 reasoning/签名会明确返回错误，不会被静默忽略。流式文本及函数参数增量在上游每次写入后同步转换并 Flush；custom tool 的 JSON 包装只有在完整校验后才安全地解包为自由文本增量。取消沿原请求 context 传播，无效工具 JSON 和异常断流不会生成成功完成事件。
+
+## Claude Code（第三方 Messages 适配）
+
+```sh
+export ANTHROPIC_BASE_URL='http://127.0.0.1:7863'
+export ANTHROPIC_AUTH_TOKEN='<占位密钥>'
+export ANTHROPIC_MODEL='cn:<GET-/v1/models-返回的模型>'
+claude
+```
+
+路由是 `${ANTHROPIC_BASE_URL}/v1/messages`，包括 Claude Code 常见的 `?beta=true`；接受 `x-api-key` 或 Bearer。支持 system、文本、HTTP/base64 图片、tools/input_schema、tool_use/tool_result、多工具及 Messages SSE。`anthropic-version` 必填；未知 `anthropic-beta` 值被视为客户端声明而非能力承诺。thinking/signature、prompt caching、context management 和非文本 tool_result 会明确报错。`/v1/messages/count_tokens` 返回 501，而不伪造精确 token 数；Claude Code 应使用自身的上下文估算并直接发送 Messages 请求。协议可连接不表示 Anthropic 官方支持或全部 Claude 功能兼容。
+
+两种客户端都建议先开新会话做文本与一次工具闭环，再迁移工作；修改旧会话 provider 只改变后续网络目的地，不会转换旧历史，也不能保证目标模型理解旧模型历史。
+
 ## 配置说明
 
 **`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。下表为字段含义速查。
@@ -353,7 +386,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `listen` | `127.0.0.1:7863` | HTTP 监听地址；容器端口映射需要显式改为 `:7863` |
+| `listen` | `:7863` | HTTP 监听地址 |
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
@@ -755,7 +788,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 2. 网络暴露与日志敏感度
 
-- 默认监听 `127.0.0.1:7863`；容器端口映射需显式配置 `:7863`。服务**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
+- 默认监听 `:7863`，compose 暴露 `0.0.0.0:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议前置反代 / 内网
 - 请求日志字段：序号 / 模型 / 模式 / 状态码 / **uid 前 8 位** / TTFB / token 数——**不含** `accessToken` / `refreshToken` / `api_key` 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**（容器内进入 `docker logs`），代码无任何落盘日志文件
 

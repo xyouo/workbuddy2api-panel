@@ -17,7 +17,7 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // "127.0.0.1:7863"
+	Listen    string `json:"listen"`     // ":7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
@@ -233,7 +233,7 @@ type Config struct {
 // Default 默认配置。
 func Default() *Config {
 	c := &Config{
-		Listen:    "127.0.0.1:7863",
+		Listen:    ":7863",
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
